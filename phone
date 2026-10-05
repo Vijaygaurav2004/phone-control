@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# phone — terminal counterpart to "Nothing Phone 3a.app".
+# Same auto-discovery: USB, then last known address, then mDNS on the local network.
+
+set -uo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+CONFIG_DIR="$HOME/.config/phone-control"
+CONFIG="$CONFIG_DIR/config"
+mkdir -p "$CONFIG_DIR"
+
+bold=$'\033[1m'; dim=$'\033[2m'; red=$'\033[31m'; grn=$'\033[32m'; ylw=$'\033[33m'; rst=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$grn" "$rst" "$*"; }
+warn() { printf '%s!%s %s\n' "$ylw" "$rst" "$*"; }
+err()  { printf '%s✗%s %s\n' "$red" "$rst" "$*" >&2; }
+hdr()  { printf '\n%s%s%s\n' "$bold" "$*" "$rst"; }
+
+PHONE_ADDR=""
+[ -f "$CONFIG" ] && . "$CONFIG"
+PHONE_ADDR="${PHONE_ADDR:-}"
+save_addr() { printf 'PHONE_ADDR="%s"\n' "$1" > "$CONFIG"; }
+
+connected()  { adb devices 2>/dev/null | grep -q "^$1[[:space:]]*device$"; }
+usb_serial() { adb devices 2>/dev/null | awk '$2=="device" && $1 !~ /:/ {print $1; exit}'; }
+
+discover() {
+  local line
+  for _ in 1 2 3 4 5 6; do
+    line="$(adb mdns services 2>/dev/null | awk -F'\t' '/_adb-tls-connect/ {print $3; exit}')"
+    [ -n "$line" ] && { printf '%s' "$line"; return 0; }
+    sleep 1
+  done
+  return 1
+}
+discover_pairing() { adb mdns services 2>/dev/null | awk -F'\t' '/_adb-tls-pairing/ {print $3; exit}'; }
+
+# Resolve a target, printing it on stdout. All chatter goes to stderr.
+resolve() {
+  adb start-server >/dev/null 2>&1
+  local s found ip
+  s="$(usb_serial)"
+  if [ -n "$s" ]; then
+    # Cable is in: learn the phone's Wi-Fi address and arm the network bridge,
+    # so the next cable-free launch works with nothing to enable on the phone.
+    ip="$(adb -s "$s" shell ip -o -4 addr show wlan0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr -d '\r')"
+    if [ -n "$ip" ] && adb -s "$s" tcpip 5555 >/dev/null 2>&1; then
+      save_addr "$ip:5555"
+      echo "  wireless armed at $ip:5555" >&2
+      for _ in 1 2 3 4 5 6 7 8; do sleep 1; connected "$s" && break; done
+    fi
+    connected "$s" && { printf '%s' "$s"; return 0; }
+  fi
+
+  if [ -n "$PHONE_ADDR" ]; then
+    connected "$PHONE_ADDR" || adb connect "$PHONE_ADDR" >/dev/null 2>&1
+    sleep 1
+    connected "$PHONE_ADDR" && { printf '%s' "$PHONE_ADDR"; return 0; }
+  fi
+
+  echo "  searching the network…" >&2
+  found="$(discover)" || return 1
+  adb connect "$found" >/dev/null 2>&1
+  sleep 1
+  connected "$found" && { save_addr "$found"; printf '%s' "$found"; return 0; }
+  return 1
+}
+
+no_phone() {
+  err "Couldn't reach the phone."
+  say ""
+  say "   ${bold}Plug in the USB cable and run this again.${rst}"
+  say "   That always works, and it re-arms the wireless connection too."
+  say ""
+  say "   ${dim}First time? On the phone: Settings → About phone → tap Build number 7×,"
+  say "   then Developer options → USB debugging ON, then plug in and tap Allow.${rst}"
+}
+
+cmd_pair() {
+  hdr "One-time pairing"
+  say "On the phone:  Settings → System → Developer options"
+  say "               → ${bold}Wireless debugging${rst} ON"
+  say "               → ${bold}Pair device with pairing code${rst}"
+  say ""
+  say "Leave that popup open."
+  printf 'Press Return when it is showing… '; read -r _
+
+  local pair_addr
+  pair_addr="$(discover_pairing)"
+  if [ -n "$pair_addr" ]; then
+    ok "Found the phone at $pair_addr"
+  else
+    printf 'Type the IP address & Port from the popup: '; read -r pair_addr
+    [ -z "$pair_addr" ] && { err "Nothing entered."; return 1; }
+  fi
+
+  printf 'Six-digit pairing code: '; read -r code
+  [ -z "$code" ] && { err "Nothing entered."; return 1; }
+
+  say ""
+  if ! adb pair "$pair_addr" "$code"; then
+    err "Pairing failed — the code expires fast and the port changes every time."
+    say "   Reopen the pairing popup and try again."
+    return 1
+  fi
+  ok "Paired"
+
+  local t; t="$(resolve)" || { no_phone; return 1; }
+  ok "Connected ($t)"
+  say ""
+  say "Done. From now on just open ${bold}Nothing Phone 3a${rst} from your Desktop,"
+  say "or run ${bold}phone${rst} here."
+}
+
+cmd_mirror() {
+  local profile="auto" screen_off=auto extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hq|--high)  profile="hq" ;;
+      --lite|--low) profile="lite" ;;
+      --dark)       screen_off=1 ;;   # force, even if still locked
+      --lit)        screen_off=0 ;;   # keep the phone's display awake
+      *)            extra+=("$1") ;;
+    esac
+    shift
+  done
+
+  local t; t="$(resolve)" || { no_phone; return 1; }
+  ok "Connected ($t) — opening mirror"
+
+  # Wake, then swipe the lock screen away. With Extend Unlock trusting this Mac,
+  # that swipe is enough and we land on the home screen.
+  adb -s "$t" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+  sleep 1
+  if adb -s "$t" shell dumpsys window 2>/dev/null | grep -q 'mDreamingLockscreen=true'; then
+    local size w h
+    size="$(adb -s "$t" shell wm size 2>/dev/null | tr -d '\r' | awk -F'[ x]' '/Physical/{print $(NF-1), $NF}')"
+    w="${size% *}"; h="${size#* }"
+    [ -n "$w" ] && [ -n "$h" ] &&
+      adb -s "$t" shell input swipe "$((w/2))" "$((h*85/100))" "$((w/2))" "$((h*25/100))" >/dev/null 2>&1
+    sleep 1
+  fi
+
+  # Blank the phone's screen only once past the lock screen — Android won't
+  # render the PIN pad into a capture, so doing it while locked blanks the window.
+  if [ "$screen_off" = auto ]; then
+    screen_off=1
+    adb -s "$t" shell dumpsys window 2>/dev/null | grep -q 'mDreamingLockscreen=true' && {
+      screen_off=0
+      warn "phone still locked — unlock it once, its screen will stay dark after that"
+    }
+  fi
+
+  local args=(-s "$t" --window-title "Nothing Phone 3a" --stay-awake --keyboard=uhid)
+  [ "$screen_off" = 1 ] && args+=(--turn-screen-off)
+  case "$profile" in
+    hq)   args+=(--video-bit-rate 16M --max-fps 60 --max-size 1200) ;;
+    lite) args+=(--video-bit-rate 2M --max-size 800 --max-fps 24 --no-audio) ;;
+    *)    args+=(--video-bit-rate 8M --max-fps 60 --max-size 1080) ;;
+  esac
+  scrcpy "${args[@]}" "${extra[@]+"${extra[@]}"}"
+}
+
+cmd_lock() {
+  local t; t="$(resolve)" || { no_phone; return 1; }
+  adb -s "$t" shell input keyevent KEYCODE_SLEEP >/dev/null 2>&1
+  sleep 1
+  if adb -s "$t" shell "dumpsys window | grep -m1 mDreamingLockscreen" 2>/dev/null | grep -q 'true'; then
+    ok "phone locked"
+  else
+    ok "screen off"
+  fi
+}
+
+cmd_unlock() {
+  local t; t="$(resolve)" || { no_phone; return 1; }
+  adb -s "$t" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+  sleep 1
+
+  local size w h
+  size="$(adb -s "$t" shell wm size 2>/dev/null | tr -d '\r' | awk -F'[ x]' '/Physical/{print $(NF-1), $NF}')"
+  w="${size% *}"; h="${size#* }"
+  [ -n "$w" ] && [ -n "$h" ] &&
+    adb -s "$t" shell input swipe "$((w/2))" "$((h*85/100))" "$((w/2))" "$((h*25/100))" >/dev/null 2>&1
+  sleep 1
+
+  if adb -s "$t" shell "dumpsys window | grep -m1 mDreamingLockscreen" 2>/dev/null | grep -q 'true'; then
+    warn "still locked — your PIN is needed, and Android won't accept it from here"
+    say "  ${dim}Type it on the phone, or set up Extend Unlock so this works remotely.${rst}"
+    return 1
+  fi
+  ok "phone unlocked"
+}
+
+cmd_shell() {
+  local t; t="$(resolve)" || { no_phone; return 1; }
+  if [ $# -gt 0 ]; then adb -s "$t" shell "$@"; else adb -s "$t" shell; fi
+}
+
+cmd_status() {
+  hdr "Phone"
+  local s; s="$(usb_serial)"
+  if [ -n "$s" ]; then ok "connected over USB ($s)"
+  elif [ -n "$PHONE_ADDR" ] && connected "$PHONE_ADDR"; then ok "connected over Wi-Fi ($PHONE_ADDR)"
+  else
+    warn "not connected"
+    local f; f="$(adb mdns services 2>/dev/null | awk -F'\t' '/_adb-tls-connect/ {print $3; exit}')"
+    [ -n "$f" ] && say "  ${dim}but I can see it on the network at $f — run: phone${rst}"
+  fi
+
+  local t=""
+  [ -n "$s" ] && t="$s"
+  [ -z "$t" ] && [ -n "$PHONE_ADDR" ] && connected "$PHONE_ADDR" && t="$PHONE_ADDR"
+  if [ -n "$t" ]; then
+    say "  ${dim}$(adb -s "$t" shell getprop ro.product.model 2>/dev/null | tr -d '\r') · Android $(adb -s "$t" shell getprop ro.build.version.release 2>/dev/null | tr -d '\r') · battery $(adb -s "$t" shell dumpsys battery 2>/dev/null | awk '/^ *level:/{print $2; exit}' | tr -d '\r')%${rst}"
+  fi
+
+  hdr "Saved address"
+  say "  ${PHONE_ADDR:-none yet}"
+
+  hdr "adb devices"
+  adb devices | tail -n +2 | sed '/^$/d' | sed 's/^/  /'
+  say ""
+}
+
+usage() {
+  cat <<EOF
+${bold}phone${rst} — mirror and control the Nothing Phone 3a
+
+  ${bold}phone${rst}            mirror + control
+  ${bold}phone${rst} --lite     low bandwidth
+  ${bold}phone${rst} --hq       max quality
+  ${bold}phone${rst} --dark     blank the phone screen (only after unlocking)
+
+  ${bold}phone lock${rst}       lock the phone
+  ${bold}phone unlock${rst}     wake and unlock it
+
+  ${bold}phone pair${rst}       one-time pairing
+  ${bold}phone status${rst}     what's connected
+  ${bold}phone shell${rst}      a shell on the phone
+
+${dim}Or just double-click ${bold}Nothing Phone 3a${rst}${dim} on your Desktop.${rst}
+EOF
+}
+
+case "${1:-mirror}" in
+  lock)           shift; cmd_lock "$@" ;;
+  unlock)         shift; cmd_unlock "$@" ;;
+  pair)           shift; cmd_pair "$@" ;;
+  status|st)      shift; cmd_status "$@" ;;
+  shell|sh)       shift; cmd_shell "$@" ;;
+  mirror)         shift; cmd_mirror "$@" ;;
+  -h|--help|help) usage ;;
+  -*)             cmd_mirror "$@" ;;
+  *)              err "Unknown command: $1"; say ""; usage; exit 1 ;;
+esac

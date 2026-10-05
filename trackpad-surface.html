@@ -1,0 +1,30 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Trackpad</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+            overscroll-behavior:none;touch-action:none;
+            -webkit-user-select:none;user-select:none;
+            font:500 15px -apple-system,Roboto,sans-serif;color:#3a3a3d}
+  #m{position:fixed;inset:0;display:grid;place-items:center;text-align:center;line-height:1.9}
+  b{display:block;color:#6a6a6f;font-weight:600;letter-spacing:.02em}
+  i{font-style:normal;font-size:13px;color:#2e2e31}
+  .dot{width:7px;height:7px;border-radius:50%;background:#d62828;margin:14px auto 0;opacity:.85}
+</style>
+<div id="m">
+  <div>
+    <b>Trackpad</b>
+    <i>drag to move · tap to click<br>two fingers to scroll</i>
+    <div class="dot"></div>
+  </div>
+</div>
+<script>
+  // Swallow every gesture so nothing scrolls, zooms or pulls to refresh —
+  // the Mac reads the raw touches underneath this page.
+  for (const ev of ['touchstart','touchmove','touchend','gesturestart','contextmenu'])
+    document.addEventListener(ev, e => e.preventDefault(), {passive:false});
+  // First tap goes fullscreen, hiding the browser chrome for good.
+  document.addEventListener('pointerdown', () => {
+    document.documentElement.requestFullscreen?.().catch(()=>{});
+  }, {once:true});
+</script>
