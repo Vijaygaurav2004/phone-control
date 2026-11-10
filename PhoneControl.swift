@@ -149,10 +149,10 @@ func setupNotifications(delegate: UNUserNotificationCenterDelegate) {
     // thing is landing you in the app itself — in its own window, phone locked.
     let open = UNNotificationAction(identifier: "OPEN_APP", title: "Open in Window",
                                     options: [.foreground])
-    center.setNotificationCategories([
+    center.setNotificationCategories(Set([
         UNNotificationCategory(identifier: "PHONE_MSG", actions: [open],
                                intentIdentifiers: [], options: [])
-    ])
+    ] + PhoneNotifs.categories()))
     center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
         useNativeNotifications = granted
     }
@@ -536,7 +536,8 @@ let ignoredPackages: Set<String> = [
 ]
 
 func pollPhoneNotifications() {
-    guard notificationsEnabled, let t = target() else { return }
+    // Touch Remote forwards notifications itself (with replies); don't double up.
+    guard notificationsEnabled, !PhoneNotifs.shared.everActive, let t = target() else { return }
 
     let dump = adb(["-s", t, "shell",
                     "dumpsys notification --noredact | grep -E 'NotificationRecord\\(|android\\.title=String|android\\.text=String|android\\.bigText=String|android\\.conversationTitle=String|android\\.textLines=CharSequence|^ +\\[[0-9]+\\] '"],
@@ -641,6 +642,10 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
     let sizeMenu = NSMenu()
     var arrowToggle = NSMenuItem()
     var trackpadToggle = NSMenuItem()
+    var dialToggle = NSMenuItem()
+    var mirrorTopToggle = NSMenuItem()
+    let dialModeMenu = NSMenu()
+    var dialModeItem = NSMenuItem()
     var notifToggle = NSMenuItem()
     var loginToggle = NSMenuItem()
     var recordItem = NSMenuItem()
@@ -658,6 +663,9 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
 
         let menu = NSMenu()
         menu.delegate = self
+        // Take control of enabling: with this on, AppKit re-enables items behind
+        // us and the greyed-out adb items come back looking clickable.
+        menu.autoenablesItems = false
         statusLine.isEnabled = false
         menu.addItem(statusLine)
         menu.addItem(.separator())
@@ -695,6 +703,19 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         trackpadToggle = entry("Use Phone as Trackpad", "", #selector(toggleTrackpad))
         menu.addItem(trackpadToggle)
 
+        mirrorTopToggle = entry("Mirror Floats Above Everything", "", #selector(toggleMirrorTop))
+        mirrorTopToggle.state = Mirror.alwaysOnTop ? .on : .off
+        menu.addItem(mirrorTopToggle)
+
+        dialToggle = entry("CMF Dial Controls the Mac", "", #selector(toggleDial))
+        dialToggle.state = Dial.shared.running ? .on : .off
+        menu.addItem(dialToggle)
+
+        dialModeItem = NSMenuItem(title: "What the Dial Does", action: nil, keyEquivalent: "")
+        dialModeItem.submenu = dialModeMenu
+        menu.addItem(dialModeItem)
+        rebuildDialModes()
+
         arrowToggle = entry("Arrow Keys Scroll Reels", "", #selector(toggleArrows))
         arrowToggle.state = arrowsEnabled ? .on : .off
         menu.addItem(arrowToggle)
@@ -719,6 +740,9 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         // without having to arm anything from the menu first.
         CommandServer.shared.start()
         Discovery.shared.start()
+        PhoneNotifs.shared.onBattery = { [weak self] level, charging in
+            DispatchQueue.main.async { self?.showBattery(level, charging) }
+        }
 
         installHotKeyHandler()
         let nc = NSWorkspace.shared.notificationCenter
@@ -891,6 +915,7 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                didReceive response: UNNotificationResponse,
                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if PhoneNotifs.shared.handle(response: response) { completionHandler(); return }
         if let pkg = response.notification.request.content.userInfo["package"] as? String {
             let label = appNames[pkg] ?? pkg
             launchAppWindow(package: pkg, label: label)
@@ -922,9 +947,10 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
 
     private func setAdbItems(enabled: Bool) {
         guard let menu = item.menu else { return }
+        dialModeItem.title = "Dial: " + Dial.shared.modeName
+        dialToggle.state = Dial.shared.running ? .on : .off
         for i in menu.items where adbOnlyTitles.contains(i.title) {
             i.isEnabled = enabled
-            i.action = enabled ? i.action : nil
             i.submenu?.items.forEach { $0.isEnabled = enabled }
         }
     }
@@ -952,9 +978,14 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
 
     func refreshBattery() {
         guard let t = target() else {
-            // A dash rather than a blank, so "out of range" never reads as a
+            // Without adb the phone app reports its own battery. Otherwise a
+            // dash rather than a blank, so "out of range" never reads as a
             // stale percentage you might trust.
-            DispatchQueue.main.async { self.item.button?.title = " —"; self.lastBattery = -1 }
+            if let b = PhoneNotifs.shared.battery, Date().timeIntervalSince(b.at) < 900 {
+                DispatchQueue.main.async { self.showBattery(b.level, b.charging) }
+            } else {
+                DispatchQueue.main.async { self.item.button?.title = " —"; self.lastBattery = -1 }
+            }
             return
         }
         let dump = adb(["-s", t, "shell", "dumpsys battery | grep -E '^  level|^  status'"], timeout: 8)
@@ -972,13 +1003,19 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         }
 
         DispatchQueue.main.async {
-            self.item.button?.title = " \(level)%"
             // Warn once per crossing, not on every poll.
-            if level <= 15 && !charging && (self.lastBattery > 15 || self.lastBattery < 0) {
+            // The phone app warns on its own when it's reporting; don't double up.
+            if PhoneNotifs.shared.battery == nil,
+               level <= 15 && !charging && (self.lastBattery > 15 || self.lastBattery < 0) {
                 notifyMac(title: "Phone battery low", body: "\(level)% left on your Nothing Phone 3a.", sound: true)
             }
-            self.lastBattery = level
+            self.showBattery(level, charging)
         }
+    }
+
+    func showBattery(_ level: Int, _ charging: Bool) {
+        item.button?.title = " \(level)%" + (charging ? "⚡︎" : "")
+        lastBattery = level
     }
 
     // MARK: Actions
@@ -1143,6 +1180,43 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
                 }
             }
         }
+    }
+
+    /// Intercepts the CMF Buds' Smart Dial and remaps it.
+    @objc func toggleMirrorTop() {
+        Mirror.alwaysOnTop.toggle()
+        UserDefaults.standard.set(Mirror.alwaysOnTop, forKey: "mirrorOnTop")
+        mirrorTopToggle.state = Mirror.alwaysOnTop ? .on : .off
+        Mirror.shared.applyOnTop()
+    }
+
+    @objc func toggleDial() {
+        Dial.shared.toggle()
+        dialToggle.state = Dial.shared.running ? .on : .off
+        if Dial.shared.running {
+            notifyMac(title: "Dial connected",
+                      body: "Turn to adjust · triple-press to change what it does.")
+        }
+    }
+
+    func rebuildDialModes() {
+        dialModeMenu.autoenablesItems = false
+        dialModeMenu.removeAllItems()
+        for m in Dial.Mode.allCases {
+            let i = NSMenuItem(title: m.rawValue, action: #selector(pickDialMode(_:)), keyEquivalent: "")
+            i.target = self
+            i.isEnabled = true
+            i.representedObject = m.rawValue
+            i.state = (Dial.shared.mode == m) ? .on : .off
+            dialModeMenu.addItem(i)
+        }
+    }
+
+    @objc func pickDialMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let m = Dial.Mode(rawValue: raw) else { return }
+        Dial.shared.setMode(m)
+        rebuildDialModes()
     }
 
     @objc func toggleArrows() {

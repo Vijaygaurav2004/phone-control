@@ -40,6 +40,15 @@ public final class Link {
         void onState(boolean connected, String host);
     }
 
+    /** Binary frames from the Mac — its screen, when the phone is viewing it. */
+    public interface FrameListener {
+        void onFrame(int type, int flags, byte[] payload);
+        void onText(String line);
+    }
+
+    private volatile FrameListener frameListener;
+    public void setFrameListener(FrameListener l) { frameListener = l; }
+
     private static final Link INSTANCE = new Link();
     public static Link get() { return INSTANCE; }
     private Link() {}
@@ -59,8 +68,15 @@ public final class Link {
     public void setHost(String h) { host = h; }
     public void setListener(Listener l) { listener = l; }
 
+    /** A second listener for background parts (the notification forwarder),
+     *  so they keep working whether or not the main screen is open. */
+    private volatile Listener side;
+    public void setSideListener(Listener l) { side = l; }
+
     public void start(String initialHost) {
-        host = initialHost;
+        // Several parts start the link; a caller without a saved host must not
+        // wipe out the one another part already found.
+        if (initialHost != null || host == null) host = initialHost;
         if (started.compareAndSet(false, true)) new Thread(this::pump, "link").start();
     }
 
@@ -68,7 +84,7 @@ public final class Link {
 
     /** A legacy command line. Always jumps ahead of queued video. */
     public void sendLine(String line) {
-        byte[] body = line.getBytes();
+        byte[] body = line.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] frame = header(T_TXT, 0, body.length);
         byte[] out = new byte[frame.length + body.length];
         System.arraycopy(frame, 0, out, 0, frame.length);
@@ -140,13 +156,38 @@ public final class Link {
 
     // ---------------------------------------------------------------- the link
 
+    /**
+     * Ask the local network where the Mac is.
+     *
+     * Android frequently refuses to send a limited broadcast (255.255.255.255)
+     * out of the Wi-Fi interface, so the subnet's own broadcast address is sent
+     * to as well — that's the one that actually reaches the Mac. Without it a
+     * stale saved address from an old network could never be replaced.
+     */
     private String discover() {
+        java.util.List<InetAddress> targets = new java.util.ArrayList<>();
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifs =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (ifs != null && ifs.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifs.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (java.net.InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress b = ia.getBroadcast();
+                    if (b != null) targets.add(b);
+                }
+            }
+        } catch (Exception ignored) {}
+        try { targets.add(InetAddress.getByName("255.255.255.255")); } catch (Exception ignored) {}
+
         try (DatagramSocket s = new DatagramSocket()) {
             s.setBroadcast(true);
-            s.setSoTimeout(1500);
+            s.setSoTimeout(1200);
             byte[] msg = "WHO".getBytes();
-            s.send(new DatagramPacket(msg, msg.length,
-                    InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT));
+            for (InetAddress t : targets) {
+                try { s.send(new DatagramPacket(msg, msg.length, t, DISCOVERY_PORT)); }
+                catch (Exception ignored) {}
+            }
             byte[] buf = new byte[128];
             DatagramPacket reply = new DatagramPacket(buf, buf.length);
             s.receive(reply);
@@ -164,7 +205,12 @@ public final class Link {
             if (host == null || misses >= 2) {
                 notifyState(false);
                 String found = discover();
-                if (found != null) { host = found; misses = 0; }
+                if (found != null) {
+                    host = found;
+                    misses = 0;
+                    Listener l = listener;
+                    if (l != null) l.onState(false, found);   // lets the UI save it
+                }
             }
             if (host == null) { sleep(1200); continue; }
 
@@ -176,9 +222,14 @@ public final class Link {
                 // A small send buffer is deliberate: it caps how many video
                 // bytes the kernel can hold ahead of a cursor update.
                 s.setSendBufferSize(64 * 1024);
+                // The Mac pings every 4 s, so 20 s of silence means the link is
+                // dead even if no FIN ever arrived (Mac asleep, Wi-Fi roam).
+                s.setSoTimeout(20000);
+                s.setKeepAlive(true);
                 final Socket sock = s;
+                final AtomicBoolean readerAlive = new AtomicBoolean(true);
                 DataOutputStream out = new DataOutputStream(s.getOutputStream());
-                BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                java.io.InputStream in = new java.io.BufferedInputStream(s.getInputStream(), 64 * 1024);
 
                 connected = true; misses = 0;
                 notifyState(true);
@@ -186,18 +237,16 @@ public final class Link {
 
                 new Thread(() -> {
                     try {
-                        String line;
-                        while ((line = in.readLine()) != null) {
-                            Listener l = listener;
-                            if (l != null) l.onLine(line);
-                        }
+                        readLoop(in);
                     } catch (Exception ignored) {
                     } finally {
+                        readerAlive.set(false);
                         try { sock.close(); } catch (Exception ignored2) {}
+                        synchronized (lock) { lock.notifyAll(); }
                     }
                 }, "link-reader").start();
 
-                writeLoop(out);
+                writeLoop(out, readerAlive);
             } catch (Exception e) {
                 misses++;
             } finally {
@@ -209,15 +258,77 @@ public final class Link {
         }
     }
 
+    /**
+     * The Mac now sends binary frames as well as text lines, so this reads
+     * bytes rather than lines. A frame can only begin at a line boundary, and
+     * its first byte 0xAB can never start a UTF-8 line — the same rule the Mac
+     * uses in the other direction.
+     */
+    private void readLoop(java.io.InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream line = new java.io.ByteArrayOutputStream(256);
+        byte[] h = new byte[8];
+        while (true) {
+            int b = in.read();
+            if (b < 0) return;
+            if (b == 0xAB && line.size() == 0) {
+                h[0] = (byte) b;
+                readFully(in, h, 1, 7);
+                int check = (h[0] ^ h[1] ^ h[2] ^ h[4] ^ h[5] ^ h[6] ^ h[7]) & 0xFF;
+                if (check != (h[3] & 0xFF)) continue;   // not really a frame
+                int len = ((h[4] & 0xFF) << 24) | ((h[5] & 0xFF) << 16)
+                        | ((h[6] & 0xFF) << 8) | (h[7] & 0xFF);
+                if (len < 0 || len > 4 * 1024 * 1024) continue;
+                byte[] payload = new byte[len];
+                readFully(in, payload, 0, len);
+                FrameListener fl = frameListener;
+                if (fl != null) fl.onFrame(h[1] & 0xFF, h[2] & 0xFF, payload);
+            } else if (b == '\n') {
+                String text = line.toString("UTF-8");
+                line.reset();
+                if (text.isEmpty()) continue;
+                Listener l = listener;
+                if (l != null) l.onLine(text);
+                Listener sl = side;
+                if (sl != null) sl.onLine(text);
+                FrameListener fl = frameListener;
+                if (fl != null && text.startsWith("CAST")) fl.onText(text);
+            } else {
+                line.write(b);
+            }
+        }
+    }
+
+    private static void readFully(java.io.InputStream in, byte[] buf, int off, int len)
+            throws java.io.IOException {
+        while (len > 0) {
+            int n = in.read(buf, off, len);
+            if (n < 0) throw new java.io.EOFException();
+            off += n; len -= n;
+        }
+    }
+
     /** Strict priority: every queued control frame goes before the next video chunk. */
-    private void writeLoop(OutputStream out) throws Exception {
+    /**
+     * Ends (by throwing) when the reader sees the socket die, and pings the Mac
+     * whenever nothing else has been sent for a few seconds. Without both, a
+     * link with no UI open (just the notification forwarder) would never notice
+     * the Mac restarting or the Wi-Fi dropping, and stay "connected" to nothing.
+     */
+    private void writeLoop(OutputStream out, AtomicBoolean readerAlive) throws Exception {
+        long lastSent = System.currentTimeMillis();
         while (true) {
             byte[] next;
             synchronized (lock) {
-                while (control.isEmpty() && video.isEmpty()) lock.wait(500);
+                while (control.isEmpty() && video.isEmpty()) {
+                    if (!readerAlive.get()) throw new java.io.EOFException("reader closed");
+                    if (System.currentTimeMillis() - lastSent > 3000) break;
+                    lock.wait(500);
+                }
                 next = !control.isEmpty() ? control.poll() : video.poll();
             }
-            if (next == null) continue;
+            if (!readerAlive.get()) throw new java.io.EOFException("reader closed");
+            if (next == null) next = pingFrame();
+            lastSent = System.currentTimeMillis();
             out.write(next);
             synchronized (lock) {
                 if (control.isEmpty() && video.isEmpty()) out.flush();
@@ -225,9 +336,20 @@ public final class Link {
         }
     }
 
+    private static byte[] pingFrame() {
+        byte[] body = "PING".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] h = header(T_TXT, 0, body.length);
+        byte[] out = new byte[h.length + body.length];
+        System.arraycopy(h, 0, out, 0, h.length);
+        System.arraycopy(body, 0, out, h.length, body.length);
+        return out;
+    }
+
     private void notifyState(boolean up) {
         Listener l = listener;
         if (l != null) l.onState(up, host);
+        Listener sl = side;
+        if (sl != null) sl.onState(up, host);
     }
 
     private static void sleep(long ms) {

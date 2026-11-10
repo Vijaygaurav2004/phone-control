@@ -3,9 +3,16 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SDK="$HOME/Library/Android/sdk"
-BT="$SDK/build-tools/36.1.0"
-JAR="$SDK/platforms/android-36/android.jar"
+# The SDK now lives in the Homebrew prefix. Pick whatever build-tools and
+# platform are actually installed rather than pinning a version that may vanish.
+SDK="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
+[ -d "$SDK/build-tools" ] || SDK="$HOME/Library/Android/sdk"
+BT="$(/bin/ls -d "$SDK"/build-tools/* 2>/dev/null | /usr/bin/sort -V | /usr/bin/tail -1)"
+JAR="$(/bin/ls "$SDK"/platforms/*/android.jar 2>/dev/null | /usr/bin/sort -V | /usr/bin/tail -1)"
+if [ -z "$BT" ] || [ -z "$JAR" ]; then
+  echo "Android SDK incomplete under $SDK — need build-tools and a platform." >&2
+  exit 1
+fi
 JAVA="/opt/homebrew/opt/openjdk/bin"
 # d8, apksigner and zipalign are wrappers that shell out to `java`.
 export JAVA_HOME="/opt/homebrew/opt/openjdk"
@@ -15,9 +22,13 @@ OUT="$HERE/android/build"
 
 rm -rf "$OUT"; mkdir -p "$OUT/classes" "$OUT/dex"
 
-# 1. Manifest into an APK skeleton (no resources to compile — the UI is drawn in code).
+# 1. Compile resources, then link them with the manifest. The accessibility
+#    service config is referenced from the manifest, so linking without
+#    resources now fails outright.
+"$BT/aapt2" compile --dir "$SRC/res" -o "$OUT/res.zip"
 "$BT/aapt2" link -I "$JAR" \
   --manifest "$SRC/AndroidManifest.xml" \
+  -R "$OUT/res.zip" --auto-add-overlay \
   --min-sdk-version 26 --target-sdk-version 34 \
   -o "$OUT/base.apk"
 

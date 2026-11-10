@@ -153,12 +153,41 @@ public class ScreenCaptureService extends Service {
     /** Pull encoded units off the codec and hand them to the link. */
     private void drain(int w, int h) {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        boolean configSent = false;
+        int framesSent = 0;
         while (running) {
             int index;
             try {
                 index = codec.dequeueOutputBuffer(info, 50_000);
             } catch (IllegalStateException e) {
                 break;   // codec went away underneath us
+            }
+
+            // Qualcomm's C2 encoders hand over SPS/PPS through the output format
+            // (csd-0 / csd-1), not as a CODEC_CONFIG buffer. Treating this event
+            // as "nothing yet" meant the Mac never got a config, so it never
+            // opened a window — while the phone happily kept encoding.
+            if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                try {
+                    MediaFormat f = codec.getOutputFormat();
+                    ByteBuffer sps = f.getByteBuffer("csd-0");
+                    ByteBuffer pps = f.getByteBuffer("csd-1");
+                    if (sps != null && pps != null) {
+                        byte[] a = new byte[sps.remaining()]; sps.get(a);
+                        byte[] b = new byte[pps.remaining()]; pps.get(b);
+                        byte[] csd = new byte[a.length + b.length];
+                        System.arraycopy(a, 0, csd, 0, a.length);
+                        System.arraycopy(b, 0, csd, a.length, b.length);
+                        Link.get().sendConfig(csd, w, h);
+                        configSent = true;
+                        Link.get().sendLine("LOG config via format change: sps=" + a.length + " pps=" + b.length);
+                    } else {
+                        Link.get().sendLine("LOG format changed but no csd-0/csd-1");
+                    }
+                } catch (Exception e) {
+                    Link.get().sendLine("LOG format read failed: " + e);
+                }
+                continue;
             }
             if (index < 0) continue;
 
@@ -174,8 +203,15 @@ public class ScreenCaptureService extends Service {
                 if (isConfig) {
                     // SPS/PPS — the Mac cannot decode a single frame without these.
                     Link.get().sendConfig(bytes, w, h);
+                    configSent = true;
+                    Link.get().sendLine("LOG config via buffer: " + bytes.length + " bytes");
                 } else {
                     Link.get().sendVideo(bytes, bytes.length, isKey);
+                    framesSent++;
+                    if (framesSent == 1 || framesSent == 30 || framesSent % 300 == 0) {
+                        Link.get().sendLine("LOG frames sent=" + framesSent
+                                + " key=" + isKey + " configSent=" + configSent);
+                    }
                 }
             }
             try { codec.releaseOutputBuffer(index, false); } catch (Exception ignored) {}

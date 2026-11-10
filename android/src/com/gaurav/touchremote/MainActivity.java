@@ -13,15 +13,12 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
-import android.text.Editable;
-import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
-import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -56,6 +53,7 @@ public class MainActivity extends Activity {
     static final long TAP_MS = 260, HOLD_MS = 420, DOUBLE_MS = 320;
 
     private volatile String host = null;
+    private long lastTouchWarn = 0;
     private SharedPreferences prefs;
     volatile boolean connected = false;
 
@@ -63,7 +61,7 @@ public class MainActivity extends Activity {
     private TrackpadView pad;
     private LinearLayout appsList;
     private TextView status, clipText;
-    private EditText keyboard;
+    private RemoteKeyboard keyboard;
     private Vibrator vibrator;
 
     // Latched modifier keys, shared by the trackpad and the key pad.
@@ -101,22 +99,8 @@ public class MainActivity extends Activity {
 
         root.addView(tabBar());
 
-        // Off-screen field: focusing it raises the keyboard; keystrokes go to the Mac.
-        keyboard = new EditText(this);
-        keyboard.setAlpha(0f);
-        keyboard.addTextChangedListener(new TextWatcher() {
-            public void beforeTextChanged(CharSequence s, int a, int c, int d) {}
-            public void onTextChanged(CharSequence s, int a, int before, int count) {
-                if (count > 0) send("K " + s.subSequence(a, a + count).toString().replace("\n", "\\n"));
-            }
-            public void afterTextChanged(Editable e) { if (e.length() > 0) e.clear(); }
-        });
-        keyboard.setOnKeyListener((v, code, ev) -> {
-            if (ev.getAction() != KeyEvent.ACTION_DOWN) return false;
-            if (code == KeyEvent.KEYCODE_DEL)   { send("P back");  return true; }
-            if (code == KeyEvent.KEYCODE_ENTER) { send("P enter"); return true; }
-            return false;
-        });
+        // Owns its InputConnection so autocorrect/predictions/backspace behave.
+        keyboard = new RemoteKeyboard(this, RemoteKeyboard.toMac());
         FrameLayout wrap = new FrameLayout(this);
         wrap.addView(root);
         wrap.addView(keyboard, new FrameLayout.LayoutParams(1, 1));
@@ -130,6 +114,7 @@ public class MainActivity extends Activity {
             public void onLine(String line) { handleFromMac(line); }
             public void onState(boolean up, String h) {
                 connected = up;
+                if (h != null && !h.equals(host)) saveHost(h);
                 ui(() -> setStatus(up ? "connected · " + h : "looking for your Mac…", up));
             }
         });
@@ -289,6 +274,14 @@ public class MainActivity extends Activity {
         col.setPadding(Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10));
 
         col.addView(Ui.label(this, "SCREEN", Ui.MUTED, 11f));
+        TextView viewMac = Ui.key(this, "Show my Mac's Screen", 16f);
+        viewMac.setPadding(Ui.dp(this, 10), Ui.dp(this, 18), Ui.dp(this, 10), Ui.dp(this, 18));
+        viewMac.setBackground(Ui.round(Ui.KEY_ON, 14, this));
+        viewMac.setOnClickListener(v -> {
+            tap();
+            startActivity(new Intent(this, CastActivity.class));
+        });
+        col.addView(viewMac);
         TextView mirror = Ui.key(this, ScreenCaptureService.active
                 ? "Stop Mirroring" : "Mirror my Screen to the Mac", 16f);
         mirror.setPadding(Ui.dp(this, 10), Ui.dp(this, 18), Ui.dp(this, 10), Ui.dp(this, 18));
@@ -299,6 +292,19 @@ public class MainActivity extends Activity {
                     ? "Stop Mirroring" : "Mirror my Screen to the Mac"), 1200);
         });
         col.addView(mirror);
+
+        TextView touch = Ui.key(this, TouchService.isLive()
+                ? "Touch control: on" : "Enable Touch Control…", 15f);
+        touch.setOnClickListener(v -> {
+            tap();
+            if (!TouchService.isLive()) TouchService.openSettings(this);
+        });
+        col.addView(touch);
+
+        TextView notifs = Ui.key(this, notifAccess()
+                ? "Notifications to Mac: on" : "Send Notifications to Mac…", 15f);
+        notifs.setOnClickListener(v -> { tap(); openNotifAccess(); });
+        col.addView(notifs);
         col.addView(Ui.spacer(this, 18));
 
         col.addView(Ui.label(this, "PLAYBACK", Ui.MUTED, 11f));
@@ -400,10 +406,29 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean notifAccess() {
+        if (Build.VERSION.SDK_INT < 27) return NotifService.running();
+        android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
+        return nm != null && nm.isNotificationListenerAccessGranted(
+                new android.content.ComponentName(this, NotifService.class));
+    }
+
+    /** Straight to Touch Remote's own switch where Android allows it. */
+    private void openNotifAccess() {
+        Intent i;
+        if (Build.VERSION.SDK_INT >= 30) {
+            i = new Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS);
+            i.putExtra(android.provider.Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                    new android.content.ComponentName(this, NotifService.class).flattenToString());
+        } else {
+            i = new Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+        }
+        try { startActivity(i); }
+        catch (Exception e) { startActivity(new Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)); }
+    }
+
     void showKeyboard() {
-        keyboard.requestFocus();
-        InputMethodManager im = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-        if (im != null) im.showSoftInput(keyboard, InputMethodManager.SHOW_IMPLICIT);
+        keyboard.show();
     }
 
     /** Remember where the Mac was, so the next launch skips discovery. */
@@ -426,6 +451,57 @@ public class MainActivity extends Activity {
             ui(() -> { if (clipText != null) clipText.setText(text.isEmpty() ? "—" : text); });
         } else if (line.equals("KEYFRAME")) {
             ScreenCaptureService.requestKeyframe();
+        } else {
+            handleTouch(line);
+        }
+    }
+
+    /**
+     * Pointer and key commands from the Mac. Coordinates arrive already in this
+     * phone's pixels — the Mac maps them from its window before sending.
+     */
+    private static final java.util.Set<String> TOUCH_VERBS = new java.util.HashSet<>(
+            java.util.Arrays.asList("TAP", "LONG", "DOWN", "MOVE", "UP", "SWIPE", "BKSP", "TYPE", "NAV"));
+
+    private void handleTouch(String line) {
+        TouchService t = TouchService.get();
+        String[] f = line.split(" ");
+        if (f.length == 0 || !TOUCH_VERBS.contains(f[0])) return;
+
+        if (t == null) {
+            // Only nag once per burst, or a drag would fire dozens of these.
+            long now = System.currentTimeMillis();
+            if (now - lastTouchWarn > 4000) {
+                lastTouchWarn = now;
+                Link.get().sendLine("TOUCH missing");
+                ui(() -> setStatus("enable Touch Remote in Accessibility", false));
+            }
+            return;
+        }
+
+        try {
+            switch (f[0]) {
+                case "TAP":   t.tap(Float.parseFloat(f[1]), Float.parseFloat(f[2])); break;
+                case "LONG":  t.longPress(Float.parseFloat(f[1]), Float.parseFloat(f[2])); break;
+                case "DOWN":  t.down(Float.parseFloat(f[1]), Float.parseFloat(f[2])); break;
+                case "MOVE":  t.moveTo(Float.parseFloat(f[1]), Float.parseFloat(f[2])); break;
+                case "UP":    t.up(Float.parseFloat(f[1]), Float.parseFloat(f[2])); break;
+                case "SWIPE": t.swipe(Float.parseFloat(f[1]), Float.parseFloat(f[2]),
+                                      Float.parseFloat(f[3]), Float.parseFloat(f[4]),
+                                      Integer.parseInt(f[5])); break;
+                case "BKSP":  t.backspace(); break;
+                case "TYPE":  if (line.length() > 5) t.type(line.substring(5)); break;
+                case "NAV":
+                    if (f.length < 2) break;
+                    if (f[1].equals("back")) t.back();
+                    else if (f[1].equals("home")) t.home();
+                    else if (f[1].equals("recents")) t.recents();
+                    else if (f[1].equals("notif")) t.notifications();
+                    break;
+                default: break;
+            }
+        } catch (Exception e) {
+            Link.get().sendLine("LOG bad touch cmd: " + line);
         }
     }
 

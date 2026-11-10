@@ -108,6 +108,22 @@ if [ -z "$TARGET" ] && [ -n "$PHONE_ADDR" ]; then
   wait_connected "$PHONE_ADDR" 20 && { TARGET="$PHONE_ADDR"; MODE="wifi"; }
 fi
 
+# Phone hotspot: when the Mac is joined to the phone's hotspot, the phone IS
+# the router, so the default gateway is the phone. The saved home-Wi-Fi
+# address is useless there. adbd in tcpip mode listens on every interface,
+# hotspot included, until the phone reboots.
+if [ -z "$TARGET" ]; then
+  gw="$(route -n get default 2>/dev/null | awk '/gateway:/ {print $2}')"
+  if [ -n "$gw" ] && [ "$gw:5555" != "$PHONE_ADDR" ]; then
+    adb connect "$gw:5555" >/dev/null 2>&1
+    if wait_connected "$gw:5555" 15; then
+      TARGET="$gw:5555"; MODE="wifi"
+    else
+      adb disconnect "$gw:5555" >/dev/null 2>&1
+    fi
+  fi
+fi
+
 # Last resort: the phone advertising itself via Wireless debugging
 if [ -z "$TARGET" ]; then
   notify "Looking for your phone…"

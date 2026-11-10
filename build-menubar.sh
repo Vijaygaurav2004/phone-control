@@ -12,7 +12,10 @@ cp "$HERE/PhoneControl.swift" "$BUILD_TMP/main.swift"
 cp "$HERE/Trackpad.swift" "$BUILD_TMP/Trackpad.swift"
 cp "$HERE/Surface.swift" "$BUILD_TMP/Surface.swift"
 cp "$HERE/Mirror.swift" "$BUILD_TMP/Mirror.swift"
-swiftc -O -o "$HERE/PhoneControl" "$BUILD_TMP/main.swift" "$BUILD_TMP/Trackpad.swift" "$BUILD_TMP/Surface.swift" "$BUILD_TMP/Mirror.swift" -framework Cocoa -framework AVFoundation
+cp "$HERE/Dial.swift" "$BUILD_TMP/Dial.swift"
+cp "$HERE/Cast.swift" "$BUILD_TMP/Cast.swift"
+cp "$HERE/Notify.swift" "$BUILD_TMP/Notify.swift"
+swiftc -O -o "$HERE/PhoneControl" "$BUILD_TMP/main.swift" "$BUILD_TMP/Trackpad.swift" "$BUILD_TMP/Surface.swift" "$BUILD_TMP/Mirror.swift" "$BUILD_TMP/Dial.swift" "$BUILD_TMP/Cast.swift" "$BUILD_TMP/Notify.swift" -framework Cocoa -framework AVFoundation -framework CoreAudio -framework ScreenCaptureKit -framework VideoToolbox
 rm -rf "$BUILD_TMP"
 
 rm -rf "$APP"

@@ -9,10 +9,111 @@ import Cocoa
 import AVFoundation
 import CoreMedia
 
+/// The mirror's content view. Clicks and drags here become taps and swipes on
+/// the phone; keystrokes become typed text.
+final class MirrorView: NSView {
+    var phoneSize = CGSize(width: 1080, height: 2392)
+    var onCommand: ((String) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// The video is letterboxed inside the view, so a click has to be mapped
+    /// through the actual picture rectangle rather than the whole view.
+    private var videoRect: CGRect {
+        let b = bounds
+        guard phoneSize.width > 0, phoneSize.height > 0, b.width > 0, b.height > 0 else { return b }
+        let scale = min(b.width / phoneSize.width, b.height / phoneSize.height)
+        let w = phoneSize.width * scale, h = phoneSize.height * scale
+        return CGRect(x: b.midX - w / 2, y: b.midY - h / 2, width: w, height: h)
+    }
+
+    /// nil when the click landed on the letterbox rather than the picture.
+    private func phonePoint(_ event: NSEvent) -> CGPoint? {
+        let p = convert(event.locationInWindow, from: nil)
+        let r = videoRect
+        guard r.contains(p) else { return nil }
+        let fx = (p.x - r.minX) / r.width
+        // AppKit's origin is bottom-left; the phone's is top-left.
+        let fy = 1 - (p.y - r.minY) / r.height
+        return CGPoint(x: fx * phoneSize.width, y: fy * phoneSize.height)
+    }
+
+    private func send(_ s: String) { onCommand?(s) }
+    private func fmt(_ p: CGPoint) -> String {
+        String(format: "%.0f %.0f", p.x, p.y)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let p = phonePoint(event) else { return }
+        window?.makeFirstResponder(self)
+        send((event.clickCount >= 2 ? "LONG " : "DOWN ") + fmt(p))
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let p = phonePoint(event) else { return }
+        send("MOVE " + fmt(p))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let p = phonePoint(event) else { return }
+        send("UP " + fmt(p))
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        send("NAV back")
+    }
+
+    /// Two-finger scroll becomes a swipe — this is how Reels and feeds move.
+    private var scrollAccum: CGFloat = 0
+    private var lastScrollAt = Date.distantPast
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let p = phonePoint(event) else { return }
+        scrollAccum += event.scrollingDeltaY
+        let now = Date()
+        guard abs(scrollAccum) > 28, now.timeIntervalSince(lastScrollAt) > 0.18 else { return }
+        lastScrollAt = now
+        let distance = min(abs(scrollAccum) * 6, phoneSize.height * 0.45)
+        let up = scrollAccum < 0        // natural scrolling: content follows fingers
+        let from = p.y + (up ? distance / 2 : -distance / 2)
+        let to   = p.y + (up ? -distance / 2 : distance / 2)
+        scrollAccum = 0
+        send(String(format: "SWIPE %.0f %.0f %.0f %.0f 110",
+                    p.x, max(0, min(phoneSize.height - 1, from)),
+                    p.x, max(0, min(phoneSize.height - 1, to))))
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 51:  send("BKSP")                 // delete
+        case 53:  send("NAV back")             // esc
+        case 36:  send("TYPE \n")              // return
+        case 126: send("NAV home")             // up arrow
+        default:
+            if let chars = event.characters, !chars.isEmpty,
+               event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+                send("TYPE " + chars)
+            }
+        }
+    }
+}
+
 final class Mirror {
     static let shared = Mirror()
 
+    /// Kept above other windows, so it stays visible while you work.
+    static var alwaysOnTop = UserDefaults.standard.object(forKey: "mirrorOnTop") as? Bool ?? true
+
+    func applyOnTop() {
+        DispatchQueue.main.async {
+            self.window?.level = Mirror.alwaysOnTop ? .floating : .normal
+            self.window?.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        }
+    }
+
     private var window: NSWindow?
+    private var contentView: MirrorView?
     private var layer: AVSampleBufferDisplayLayer?
     private var format: CMFormatDescription?
     private var sps: Data?
@@ -20,6 +121,7 @@ final class Mirror {
     private var phoneSize = CGSize(width: 1080, height: 2392)
     private var pending = Data()          // accumulates chunks of one access unit
     private var waitingForKeyframe = true
+    private var frameCount = 0
 
     // MARK: - Window
 
@@ -37,9 +139,12 @@ final class Mirror {
         win.backgroundColor = .black
         win.contentAspectRatio = NSSize(width: phoneSize.width, height: phoneSize.height)
 
-        let view = NSView(frame: rect)
+        let view = MirrorView(frame: rect)
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.black.cgColor
+        view.phoneSize = phoneSize
+        view.onCommand = { CommandServer.shared.send($0) }
+        self.contentView = view
 
         let display = AVSampleBufferDisplayLayer()
         display.videoGravity = .resizeAspect
@@ -59,7 +164,13 @@ final class Mirror {
         view.layer?.addSublayer(display)
         view.layerContentsRedrawPolicy = .onSetNeedsDisplay
 
+        // Show on every desktop, and over full-screen apps — otherwise the
+        // window is stranded on whichever Space it happened to open in.
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        if Mirror.alwaysOnTop { win.level = .floating }
+
         win.contentView = view
+        win.makeFirstResponder(view)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -77,6 +188,7 @@ final class Mirror {
         DispatchQueue.main.async {
             self.window?.orderOut(nil)
             self.window = nil
+            self.contentView = nil
             self.layer = nil
             self.format = nil
             self.sps = nil; self.pps = nil
@@ -98,6 +210,8 @@ final class Mirror {
             default: break
             }
         }
+        NSLog("[mirror] config %d bytes, %dx%d, sps=%@ pps=%@", csd.count, width, height,
+              foundSPS == nil ? "no" : "yes", foundPPS == nil ? "no" : "yes")
         guard let s = foundSPS, let p = foundPPS else { return }
 
         DispatchQueue.main.async {
@@ -123,10 +237,14 @@ final class Mirror {
                     }
                 }
             }
-            guard ok == noErr, let d = desc else { return }
+            guard ok == noErr, let d = desc else {
+                NSLog("[mirror] format description FAILED: %d", ok); return
+            }
+            NSLog("[mirror] format description ok — opening window")
             self.format = d
             self.waitingForKeyframe = true
             self.ensureWindow()
+            self.contentView?.phoneSize = self.phoneSize
             self.window?.contentAspectRatio = NSSize(width: self.phoneSize.width,
                                                      height: self.phoneSize.height)
         }
@@ -193,7 +311,12 @@ final class Mirror {
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
 
+        frameCount += 1
+        if frameCount == 1 || frameCount % 300 == 0 {
+            NSLog("[mirror] decoded frame %d, layer status %d", frameCount, layer.status.rawValue)
+        }
         if layer.status == .failed {
+            NSLog("[mirror] layer FAILED: %@", String(describing: layer.error))
             layer.flush()
             waitingForKeyframe = true
             CommandServer.shared.send("KEYFRAME")   // ask the phone for a fresh IDR

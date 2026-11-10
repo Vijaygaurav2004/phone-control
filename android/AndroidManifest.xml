@@ -13,6 +13,14 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
+  <!-- Lets the notification forwarder show app names (WhatsApp, Gmail…). -->
+  <queries>
+    <intent>
+      <action android:name="android.intent.action.MAIN"/>
+      <category android:name="android.intent.category.LAUNCHER"/>
+    </intent>
+  </queries>
+
   <application android:label="Touch Remote" android:allowBackup="false">
     <activity android:name=".MainActivity"
               android:exported="true"
@@ -25,11 +33,43 @@
       </intent-filter>
     </activity>
 
+    <!-- Your Mac's screen. Landscape, because the Mac is. -->
+    <activity android:name=".CastActivity"
+              android:exported="false"
+              android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+              android:screenOrientation="sensorLandscape"
+              android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"/>
+
+    <!-- The injector. android:permission is what this service REQUIRES of
+         whoever binds it, so only the system can — it is NOT a <uses-permission>,
+         and getting that wrong means it never appears in Settings at all. -->
+    <service android:name=".TouchService"
+             android:exported="true"
+             android:label="Touch Remote"
+             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+      <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService"/>
+      </intent-filter>
+      <meta-data android:name="android.accessibilityservice"
+                 android:resource="@xml/accessibility_service_config"/>
+    </service>
+
     <!-- foregroundServiceType is mandatory from API 34; without it
          startForeground() throws InvalidForegroundServiceTypeException. -->
     <service android:name=".ScreenCaptureService"
              android:exported="false"
              android:stopWithTask="true"
              android:foregroundServiceType="mediaProjection"/>
+
+    <!-- Phone notifications on the Mac, with replies. Turned on by the user in
+         Settings → notification access; only the system can bind it. -->
+    <service android:name=".NotifService"
+             android:exported="true"
+             android:label="Touch Remote — notifications to Mac"
+             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+      <intent-filter>
+        <action android:name="android.service.notification.NotificationListenerService"/>
+      </intent-filter>
+    </service>
   </application>
 </manifest>

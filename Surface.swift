@@ -15,18 +15,31 @@ let surfacePort: UInt16 = 8787
 // MARK: - Injecting into the Mac
 
 func typeOnMac(_ text: String) {
-    let chars = Array(text.utf16)
-    guard !chars.isEmpty else { return }
-    for down in [true, false] {
-        guard let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { continue }
-        e.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
-        e.post(tap: .cghidEventTap)
+    // One event per character. A single event carrying a whole string gets
+    // truncated or mangled by Chrome/Electron apps (Slack, Claude, VS Code), and
+    // space/newline go out as their real keys so every app treats them normally.
+    let src = CGEventSource(stateID: .hidSystemState)
+    for ch in text {
+        switch ch {
+        case " ":  pressKey(0x31); continue
+        case "\n", "\r", "\r\n": pressKey(0x24); continue
+        case "\t": pressKey(0x30); continue
+        default: break
+        }
+        let units = Array(String(ch).utf16)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down) else { continue }
+            e.flags = []
+            e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+            e.post(tap: .cghidEventTap)
+        }
     }
 }
 
 func pressKey(_ code: CGKeyCode, flags: CGEventFlags = []) {
+    let src = CGEventSource(stateID: .hidSystemState)
     for down in [true, false] {
-        guard let e = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { continue }
+        guard let e = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down) else { continue }
         e.flags = flags
         e.post(tap: .cghidEventTap)
     }
@@ -289,13 +302,13 @@ func runShortcut(_ name: String) {
     case "switcher":   pressKey(0x30, flags: .maskCommand)
     case "screenshot": pressKey(0x15, flags: [.maskCommand, .maskShift])     // Cmd+Shift+4
     case "fullscreen": pressKey(0x03, flags: [.maskCommand, .maskControl])
-    case "mission":    pressKey(0x7E, flags: .maskControl)
-    case "expose":     pressKey(0x7D, flags: .maskControl)
+    case "mission":    missionKey(0x7E)
+    case "expose":     missionKey(0x7D)
     case "launchpad":  pressKey(0x76)
     case "prevApp":    cycleApp(next: false)
     case "nextApp":    cycleApp(next: true)
-    case "desktopL":   pressKey(0x7B, flags: .maskControl)
-    case "desktopR":   pressKey(0x7C, flags: .maskControl)
+    case "desktopL":   switchSpace(right: false)
+    case "desktopR":   switchSpace(right: true)
     case "lock":       pressKey(0x0C, flags: [.maskCommand, .maskControl])   // Cmd+Ctrl+Q
     case "left":       pressKey(0x7B, flags: latchedFlags)
     case "right":      pressKey(0x7C, flags: latchedFlags)
@@ -317,6 +330,28 @@ func macApps() -> [String] {
         .compactMap { $0.localizedName }
         .sorted { $0.lowercased() < $1.lowercased() }
 }
+
+/// What a three-finger swipe does on a real trackpad: slide to the adjacent
+/// Space or full-screen app. Real arrow keys carry the fn and numeric-pad flags,
+/// and Mission Control silently ignores a synthesised arrow without them — that
+/// is why plain Ctrl+Arrow looked dead. The Control key is pressed for real
+/// around it, because some macOS versions check modifier state, not just flags.
+func missionKey(_ code: CGKeyCode) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    let ctrl: CGKeyCode = 0x3B
+    let flags: CGEventFlags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+    func post(_ k: CGKeyCode, _ down: Bool, _ f: CGEventFlags) {
+        guard let e = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: down) else { return }
+        e.flags = f
+        e.post(tap: .cghidEventTap)
+    }
+    post(ctrl, true, .maskControl)
+    post(code, true, flags)
+    post(code, false, flags)
+    post(ctrl, false, [])
+}
+
+func switchSpace(right: Bool) { missionKey(right ? 0x7C : 0x7B) }
 
 /// Bring the next/previous app to the front. Ctrl+Arrow only moves between
 /// Spaces — useless if you keep everything on one desktop — whereas this always
@@ -364,9 +399,53 @@ final class CommandServer {
     private var client: NWConnection?
     private(set) var running = false
 
+    var hasClient: Bool {
+        if case .ready? = client?.state { return true }
+        return false
+    }
+
     /// Push a line back to the phone (app lists, clipboard, status).
     func send(_ line: String) {
         client?.send(content: Data((line + "\n").utf8), completion: .idempotent)
+    }
+
+    var isConnected: Bool { client?.state == .ready }
+
+    /// Liveness both ways. The phone pings every few seconds; we ping back. A
+    /// socket that goes quiet (Wi-Fi drop, phone asleep without a FIN) is torn
+    /// down, so the phone reconnects instead of both sides trusting a dead link.
+    var lastHeard = Date()
+    private var heartbeat: DispatchSourceTimer?
+    private func startHeartbeat() {
+        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        t.schedule(deadline: .now() + 4, repeating: 4)
+        t.setEventHandler { [weak self] in
+            guard let self, let c = self.client, c.state == .ready else { return }
+            if Date().timeIntervalSince(self.lastHeard) > 15 {
+                c.cancel()
+            } else {
+                self.send("PING")
+            }
+        }
+        t.resume()
+        heartbeat = t
+    }
+
+    /// A binary frame to the phone, in the same 8-byte envelope it uses to send
+    /// its own screen. Returns nil when no phone is connected.
+    @discardableResult
+    func sendFrame(type: UInt8, flags: UInt8, payload: Data,
+                   onSent: (() -> Void)? = nil) -> Bool {
+        guard let c = client else { return false }
+        let len = UInt32(payload.count)
+        var h: [UInt8] = [0xAB, type, flags, 0,
+                          UInt8((len >> 24) & 0xFF), UInt8((len >> 16) & 0xFF),
+                          UInt8((len >> 8) & 0xFF), UInt8(len & 0xFF)]
+        h[3] = h[0] ^ h[1] ^ h[2] ^ h[4] ^ h[5] ^ h[6] ^ h[7]
+        var data = Data(h)
+        data.append(payload)
+        c.send(content: data, completion: .contentProcessed { _ in onSent?() })
+        return true
     }
 
     func start(port: UInt16 = 8788) {
@@ -382,9 +461,19 @@ final class CommandServer {
             conn.start(queue: .global(qos: .userInteractive))
             self?.client?.cancel()      // drop the previous socket, replies follow the live one
             self?.client = conn
+            self?.lastHeard = Date()
+            conn.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .failed, .cancelled:
+                    Cast.shared.stop()
+                    if self?.client === conn { PhoneNotifs.shared.appActive = false }
+                default: break
+                }
+            }
             self?.read(conn, buffer: [])
         }
         l.start(queue: .global(qos: .userInteractive))
+        startHeartbeat()
         listener = l
         running = true
     }
@@ -395,12 +484,16 @@ final class CommandServer {
     }
 
     private func read(_ conn: NWConnection, buffer: [UInt8]) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, _ in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
             guard let self else { return }
             var buf = buffer
-            if let data, !data.isEmpty { buf.append(contentsOf: data) }
+            if let data, !data.isEmpty {
+                buf.append(contentsOf: data)
+                if self.client === conn { self.lastHeard = Date() }
+            }
             let leftover = self.consume(buf)
-            if done { conn.cancel() } else { self.read(conn, buffer: leftover) }
+            // An error must end the loop too, or a failed socket spins here forever.
+            if done || error != nil { conn.cancel() } else { self.read(conn, buffer: leftover) }
         }
     }
 
@@ -459,6 +552,16 @@ final class CommandServer {
     private var warnedUntrusted = false
 
     private func run(command line: String) {
+        if PhoneNotifs.shared.handle(line: line) { return }
+        // Typed text first, by bytes: splitting on " " works on grapheme
+        // clusters, and a space followed by a combining mark (Indic vowel signs,
+        // emoji skin tones, accents) is ONE cluster — the text would vanish.
+        if line.utf8.starts(with: "K ".utf8) {
+            let text = String(decoding: line.utf8.dropFirst(2), as: UTF8.self)
+                .replacingOccurrences(of: "\\n", with: "\n")
+            if !text.isEmpty { typeOnMac(text) }
+            return
+        }
         let f = line.split(separator: " ", maxSplits: 3).map(String.init)
         guard let verb = f.first else { return }
 
@@ -505,10 +608,10 @@ final class CommandServer {
             case "G":   // desktop gestures
                 guard f.count >= 2 else { return }
                 switch f[1] {
-                case "sl": cycleApp(next: false)
-                case "sr": cycleApp(next: true)
-                case "mc": pressKey(0x7E, flags: .maskControl)
-                case "ae": pressKey(0x7D, flags: .maskControl)
+                case "sl": switchSpace(right: false)
+                case "sr": switchSpace(right: true)
+                case "mc": missionKey(0x7E)          // Mission Control
+                case "ae": missionKey(0x7D)          // App Exposé
                 default: break
                 }
 
@@ -574,7 +677,34 @@ final class CommandServer {
                 case "enter": pressKey(0x24)
                 case "tab":   pressKey(0x30)
                 case "esc":   pressKey(0x35)
+                case "left":  pressKey(0x7B)
+                case "right": pressKey(0x7C)
+                case "up":    pressKey(0x7E)
+                case "down":  pressKey(0x7D)
+                case "fwd":   pressKey(0x75)              // forward delete
                 default: break
+                }
+
+            case "DIAL":   // lets the dial be started without the menu
+                Dial.shared.toggle()
+                CommandServer.shared.send("DIAL " + (Dial.shared.running ? "on" : "off"))
+
+            case "CASTKEY":
+                Cast.shared.requestKeyframe()
+
+            case "CAST":   // the phone wants to see this Mac's screen
+                if f.count >= 2, f[1] == "start" { Cast.shared.start() }
+                else { Cast.shared.stop() }
+
+            // Absolute input from the phone's view of this Mac: fractions 0…1.
+            case "AT", "AR", "AD", "AM", "AU":
+                guard f.count >= 3, let fx = Double(f[1]), let fy = Double(f[2]) else { return }
+                switch verb {
+                case "AT": Cast.shared.tap(fx: fx, fy: fy)
+                case "AR": Cast.shared.tap(fx: fx, fy: fy, right: true)
+                case "AD": Cast.shared.press(fx: fx, fy: fy)
+                case "AM": Cast.shared.drag(fx: fx, fy: fy)
+                default:   Cast.shared.release(fx: fx, fy: fy)
                 }
 
             case "PING":
@@ -607,6 +737,9 @@ final class Discovery {
         guard s >= 0 else { return }
         var yes: Int32 = 1
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        // Lets a second listener share the port, so discovery can be watched
+        // from outside without stopping the app.
+        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(s, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in()
@@ -637,6 +770,8 @@ final class Discovery {
 
                 let sender = String(cString: inet_ntoa(from.sin_addr))
                 let reply = "MAC " + (Discovery.bestAddress(facing: sender) ?? "")
+                NSLog("[discovery] WHO from %@ -> replying %@", sender, reply)
+                Discovery.shared.noteAsk(from: sender)
                 _ = reply.withCString { body in
                     withUnsafePointer(to: &from) {
                         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -645,6 +780,27 @@ final class Discovery {
                     }
                 }
             }
+        }
+    }
+
+    private var asks: [String: [Date]] = [:]
+    private var lastWarning = Date.distantPast
+
+    /// The phone's broadcasts arrive, but if it keeps asking and never connects,
+    /// our direct reply is being dropped — almost always a router isolating
+    /// devices from each other. Say so, instead of failing silently.
+    func noteAsk(from sender: String) {
+        let now = Date()
+        var times = (asks[sender] ?? []).filter { now.timeIntervalSince($0) < 30 }
+        times.append(now)
+        asks[sender] = times
+        guard times.count >= 5, !CommandServer.shared.hasClient,
+              now.timeIntervalSince(lastWarning) > 600 else { return }
+        lastWarning = now
+        NSLog("[discovery] %@ can see this Mac but can't reach it — likely client isolation", sender)
+        DispatchQueue.main.async {
+            notifyMac(title: "Your phone can't reach this Mac",
+                      body: "It can see the Mac on the network, but your router is blocking direct connections between devices. Put both on the same Wi-Fi name, or turn off client/AP isolation on the router.")
         }
     }
 
