@@ -87,8 +87,15 @@ if [ -n "$serial" ]; then
       adb connect "$ip:5555" >/dev/null 2>&1
       if wait_connected "$ip:5555" 8; then
         save_addr "$ip:5555"
+      elif [ "$(adb -s "$serial" shell getprop service.adb.tcp.port 2>/dev/null | tr -d '\r')" = "5555" ]; then
+        # Already listening wirelessly — the Wi-Fi just can't reach it (router
+        # isolation). Restarting the bridge would only knock USB offline.
+        save_addr "$ip:5555"
       elif adb -s "$serial" tcpip 5555 >/dev/null 2>&1; then
         save_addr "$ip:5555"
+        # tcpip restarts adbd: USB vanishes for ~1s, then returns. Wait for
+        # the drop to happen before polling, or we see the stale entry.
+        sleep 1.5
         wait_connected "$serial" 60 || { TARGET=""; MODE=""; }
       fi
     fi
@@ -208,8 +215,22 @@ fi
 
 # Prefer the copy inside the bundle — running it from here is what makes macOS
 # call the app "Nothing Phone 3a" rather than "scrcpy".
+SCRCPY="scrcpy"
 if [ -x "$HERE/scrcpy" ] && [ -f "$RES/scrcpy-server" ]; then
   export SCRCPY_SERVER_PATH="$RES/scrcpy-server"
-  exec "$HERE/scrcpy" "${args[@]}"
+  SCRCPY="$HERE/scrcpy"
 fi
-exec scrcpy "${args[@]}"
+
+# Make sure the phone is really there before opening, and if the mirror dies
+# within a few seconds (phone blipped off the bridge), wait and try again
+# instead of silently vanishing.
+for attempt in 1 2 3; do
+  wait_connected "$TARGET" 50
+  start=$(date +%s)
+  "$SCRCPY" "${args[@]}" && exit 0
+  [ $(( $(date +%s) - start )) -gt 8 ] && exit 0   # ran fine, then closed
+  sleep 1
+done
+fail "The mirror couldn't start — the phone keeps dropping off the cable.
+
+Unplug and replug the USB cable, then open this app again."
