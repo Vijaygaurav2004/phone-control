@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="accessibility_service_description">Lets Touch Remote tap, swipe and type on this phone when your Mac sends a gesture. Nothing leaves your local network.</string>
+  <string name="accessibility_service_summary">Remote taps, swipes and typing from your Mac</string>
+</resources>

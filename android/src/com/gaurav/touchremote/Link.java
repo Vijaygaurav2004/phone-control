@@ -66,12 +66,22 @@ public final class Link {
     public boolean isConnected() { return connected; }
     public String host() { return host; }
     public void setHost(String h) { host = h; }
-    public void setListener(Listener l) { listener = l; }
+    /** A new listener hears the current state at once. Android rebuilds the
+     *  screen on config changes (locale, dark mode, fonts); without this the
+     *  rebuilt screen says "looking for your Mac" over a live link until the
+     *  next reconnect. */
+    public void setListener(Listener l) {
+        listener = l;
+        if (l != null && host != null) l.onState(connected, host);
+    }
 
     /** A second listener for background parts (the notification forwarder),
      *  so they keep working whether or not the main screen is open. */
     private volatile Listener side;
-    public void setSideListener(Listener l) { side = l; }
+    public void setSideListener(Listener l) {
+        side = l;
+        if (l != null && host != null) l.onState(connected, host);
+    }
 
     public void start(String initialHost) {
         // Several parts start the link; a caller without a saved host must not

@@ -8,6 +8,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.os.Build;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -120,12 +121,45 @@ public class MainActivity extends Activity {
         });
         link.start(host);
 
-        new Thread(() -> {
+        heartbeat = new Thread(() -> {
             while (true) {
                 try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
                 if (connected) send("PING");
             }
-        }, "heartbeat").start();
+        }, "heartbeat");
+        heartbeat.start();
+    }
+
+    private Thread heartbeat;
+    private WifiManager.WifiLock wifiLock;
+
+    // Android's Wi-Fi power-save parks the radio between beacons: LAN round
+    // trips go from ~5 ms to 60-150 ms and the phone can stop answering for
+    // seconds — the trackpad lags, then freezes. Hold a low-latency lock only
+    // while this screen is in front, so the battery cost ends when you leave.
+    @Override protected void onResume() {
+        super.onResume();
+        try {
+            if (wifiLock == null) {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                int mode = Build.VERSION.SDK_INT >= 29
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wm.createWifiLock(mode, "touchremote:trackpad");
+                wifiLock.setReferenceCounted(false);
+            }
+            wifiLock.acquire();
+        } catch (Exception ignored) {}
+    }
+
+    @Override protected void onPause() {
+        super.onPause();
+        try { if (wifiLock != null) wifiLock.release(); } catch (Exception ignored) {}
+    }
+
+    @Override protected void onDestroy() {
+        super.onDestroy();
+        if (heartbeat != null) heartbeat.interrupt();   // one per screen, not one per rebuild
     }
 
     // ------------------------------------------------------------ chrome
