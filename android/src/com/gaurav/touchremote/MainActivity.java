@@ -92,6 +92,7 @@ public class MainActivity extends Activity {
         sp.gravity = Gravity.CENTER_HORIZONTAL;
         sp.setMargins(0, Ui.dp(this, 10), 0, Ui.dp(this, 6));
         status.setPadding(Ui.dp(this, 16), Ui.dp(this, 7), Ui.dp(this, 16), Ui.dp(this, 7));
+        status.setOnClickListener(v -> { if (stuckShown) openWifiPanel(); });
         root.addView(status, sp);
 
         stage = new FrameLayout(this);
@@ -115,8 +116,10 @@ public class MainActivity extends Activity {
             public void onLine(String line) { handleFromMac(line); }
             public void onState(boolean up, String h) {
                 connected = up;
+                if (up) downSince = 0;
+                else if (downSince == 0) downSince = System.currentTimeMillis();
                 if (h != null && !h.equals(host)) saveHost(h);
-                ui(() -> setStatus(up ? "connected · " + h : "looking for your Mac…", up));
+                ui(() -> showLinkState(h));
             }
         });
         link.start(host);
@@ -150,11 +153,14 @@ public class MainActivity extends Activity {
             }
             wifiLock.acquire();
         } catch (Exception ignored) {}
+        status.removeCallbacks(linkTicker);
+        status.post(linkTicker);
     }
 
     @Override protected void onPause() {
         super.onPause();
         try { if (wifiLock != null) wifiLock.release(); } catch (Exception ignored) {}
+        status.removeCallbacks(linkTicker);
     }
 
     @Override protected void onDestroy() {
@@ -540,6 +546,49 @@ public class MainActivity extends Activity {
     }
 
     private void ui(Runnable r) { new Handler(Looper.getMainLooper()).post(r); }
+
+    // When does "looking" become "stuck"? Discovery answers in well under a
+    // second on a healthy network, so 15 s of nothing means the router has
+    // stopped delivering to this phone (seen on the AirFiber: the phone stays
+    // associated and can send, but receives nothing until it rejoins). Apps
+    // can't rejoin Wi-Fi on Android 10+, so offer the one-tap Wi-Fi panel.
+    private volatile long downSince = System.currentTimeMillis();
+    private static final long STUCK_MS = 15000;
+    private boolean stuckShown;
+
+    private void showLinkState(String h) {
+        if (connected) {
+            stuckShown = false;
+            setStatus("connected · " + h, true);
+        } else if (downSince != 0 && System.currentTimeMillis() - downSince > STUCK_MS) {
+            stuckShown = true;
+            status.setText("⚠ Wi-Fi stuck — tap, turn Wi-Fi off & on");
+            status.setTextColor(0xFFFFC46B);
+            status.setBackground(Ui.round(0xFF2A2112, 20, this));
+        } else {
+            stuckShown = false;
+            setStatus("looking for your Mac…", false);
+        }
+    }
+
+    private final Runnable linkTicker = new Runnable() {
+        @Override public void run() {
+            showLinkState(Link.get().host());
+            status.postDelayed(this, 2000);
+        }
+    };
+
+    private void openWifiPanel() {
+        try {
+            Intent i = Build.VERSION.SDK_INT >= 29
+                    ? new Intent(android.provider.Settings.Panel.ACTION_WIFI)
+                    : new Intent(android.provider.Settings.ACTION_WIFI_SETTINGS);
+            startActivity(i);
+        } catch (Exception e) {
+            try { startActivity(new Intent(android.provider.Settings.ACTION_WIFI_SETTINGS)); }
+            catch (Exception ignored) {}
+        }
+    }
 
     private void setStatus(String text, boolean ok) {
         status.setText((ok ? "● " : "○ ") + text);

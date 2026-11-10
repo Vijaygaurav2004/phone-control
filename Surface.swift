@@ -797,10 +797,10 @@ final class Discovery {
         guard times.count >= 5, !CommandServer.shared.hasClient,
               now.timeIntervalSince(lastWarning) > 600 else { return }
         lastWarning = now
-        NSLog("[discovery] %@ can see this Mac but can't reach it — likely client isolation", sender)
+        NSLog("[discovery] %@ can see this Mac but nothing reaches the phone — router stopped delivering to it", sender)
         DispatchQueue.main.async {
             notifyMac(title: "Your phone can't reach this Mac",
-                      body: "It can see the Mac on the network, but your router is blocking direct connections between devices. Put both on the same Wi-Fi name, or turn off client/AP isolation on the router.")
+                      body: "The phone is on the Wi-Fi but the router has stopped delivering to it. Turn the phone's Wi-Fi off and on — it reconnects in seconds.")
         }
     }
 
